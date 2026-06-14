@@ -5,16 +5,15 @@ services:
     runtime: python
     pythonVersion: "3.11"
     region: oregon
-    plan: starter  # free tier has 512MB RAM — may OOM under torch; starter is safer
+    plan: free
     rootDir: backend
-    # Install CPU-only torch first to avoid pulling the ~2GB CUDA build.
-    # sentence-transformers will reuse the already-installed torch instead of
-    # downloading the GPU variant, cutting build time by several minutes.
-    buildCommand: pip install torch --index-url https://download.pytorch.org/whl/cpu && pip install -r requirements.txt
+    buildCommand: pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
     envVars:
       - key: ANTHROPIC_API_KEY
-        sync: false  # set this manually in the Render dashboard — never commit it
+        sync: false  # set this manually in the Render dashboard. DO NOT COMMIT.
+      - key: OPENAI_API_KEY
+        sync: false  # set this manually in the Render dashboard. do not commit.
       - key: ALLOWED_ORIGINS
         sync: false  # set to your Vercel URL, e.g. https://syllabusai.vercel.app

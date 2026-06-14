@@ -4,23 +4,30 @@ vector_store.py — ChromaDB wrapper for per-session chunk storage + retrieval
 Run directly to test: python vector_store.py path/to/syllabus.pdf
 """
 
+import os
 import sys
 import chromadb
-from sentence_transformers import SentenceTransformer
+from openai import OpenAI
+
+_EMBED_MODEL = "text-embedding-3-small"
+
+
+def _embed(client: OpenAI, texts: list[str]) -> list[list[float]]:
+    response = client.embeddings.create(model=_EMBED_MODEL, input=texts)
+    return [e.embedding for e in response.data]
 
 
 class VectorStore:
     def __init__(self, persist_dir: str = "./chroma_db"):
         self.client = chromadb.PersistentClient(path=persist_dir)
-        # Load once at startup — inference is cheap after the model is in memory
-        self.model = SentenceTransformer("all-MiniLM-L6-v2")
+        self.openai = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
     def store_chunks(self, session_id: str, chunks: list[dict]) -> None:
         """Embed chunks and store them in a session-scoped ChromaDB collection."""
         collection = self.client.get_or_create_collection(f"session_{session_id}")
 
         texts = [c["text"] for c in chunks]
-        embeddings = self.model.encode(texts).tolist()
+        embeddings = _embed(self.openai, texts)
         ids = [f"{session_id}_{i}" for i in range(len(chunks))]
         metadatas = [
             {
@@ -40,7 +47,7 @@ class VectorStore:
         Returns list of {text, page, source, chunk_index, distance}.
         """
         collection = self.client.get_collection(f"session_{session_id}")
-        query_embedding = self.model.encode([question]).tolist()
+        query_embedding = _embed(self.openai, [question])
 
         results = collection.query(query_embeddings=query_embedding, n_results=k)
 
@@ -82,7 +89,7 @@ if __name__ == "__main__":
     store = VectorStore()
     session_id = "test-session"
 
-    print("Storing chunks (embedding now — takes a few seconds on first run)...")
+    print("Storing chunks (embedding via OpenAI API)...")
     store.store_chunks(session_id, chunks)
     print("Stored.\n")
 
