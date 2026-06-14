@@ -1,0 +1,41 @@
+# Environment
+.env
+.env.local
+.env.*.local
+.env.production
+.env.development
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+*.log
+
+# ChromaDB local data
+backend/chroma_db/
+
+# SQLite session database
+backend/sessions.db
+
+# Uploaded PDFs (temp files cleaned up, but just in case)
+*.pdf
+
+# Node
+node_modules/
+dist/
+build/
+.vite/
+
+# Claude Code
+.claude/
+CLAUDE.md
+
+# OS
+.DS_Store
+Thumbs.db
