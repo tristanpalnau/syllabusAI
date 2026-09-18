@@ -2,7 +2,9 @@
 
 A RAG-based web app that lets students upload a course syllabus PDF and ask natural language questions about it. Built with a two-layer architecture that puts deterministic extraction *before* vector search — so "when is the midterm?" never wastes a token on retrieval.
 
-**Live demo:** _coming soon_
+**Live demo:** https://syllabus-ai-wapv.vercel.app
+
+> The backend runs on Render's free tier and spins down after 15 minutes of inactivity, so the first upload after an idle period takes a few seconds longer while the process starts.
 
 ---
 
@@ -36,7 +38,7 @@ Most RAG demos are just wrappers: input → LLM → output. SyllabusAI routes qu
 
 **Layer 1 — Structured extraction:** On upload, a single Claude call (tool-use API, forced JSON schema) pulls typed fields — exam dates, deadlines, grade weights, late policy, office hours, instructor — into a `SyllabusStructure` dataclass. Stored in SQLite. Zero LLM cost per query after that.
 
-**Layer 2 — Semantic RAG:** For open-ended policy questions, the query is embedded with `sentence-transformers/all-MiniLM-L6-v2` and matched against section-aware chunks in ChromaDB. Top-k results go to Claude with a strict "only answer from context" prompt.
+**Layer 2 — Semantic RAG:** For open-ended policy questions, the query is embedded with OpenAI `text-embedding-3-small` and matched against section-aware chunks in ChromaDB. Top-k results (k=4) go to Claude with a strict "only answer from context" prompt.
 
 **Section-aware chunking:** PDFs are split at section headers first (regex: all-caps lines, lines ending in `:`), then sub-chunked at 800 chars with 50-char overlap. Each chunk carries `section_name`, `page_number`, and `chunk_index` metadata. This prevents late-policy text from bleeding into grading rubric text during retrieval.
 
@@ -48,7 +50,7 @@ Most RAG demos are just wrappers: input → LLM → output. SyllabusAI routes qu
 |---|---|
 | Backend | Python 3.11, FastAPI, Uvicorn |
 | Vector DB | ChromaDB (local persistent) |
-| Embeddings | sentence-transformers `all-MiniLM-L6-v2` |
+| Embeddings | OpenAI `text-embedding-3-small` (API, no local model) |
 | LLM | Anthropic Claude (`claude-haiku-4-5-20251001`) |
 | PDF parsing | pdfplumber |
 | Session storage | SQLite (stdlib) |
@@ -113,11 +115,10 @@ syllabusai/
 cd backend
 python -m venv venv
 source venv/bin/activate  # Windows: venv\Scripts\activate
-pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install -r requirements.txt
 
 cp .env.example .env
-# Add your ANTHROPIC_API_KEY to .env
+# Add your ANTHROPIC_API_KEY and OPENAI_API_KEY to .env
 
 uvicorn main:app --reload
 # API available at http://localhost:8000
@@ -145,9 +146,10 @@ npm run dev
 2. In Render dashboard → **New Web Service** → connect repo.
 3. Render will auto-detect `render.yaml`. Review and confirm.
 4. Set environment variables in the Render dashboard:
-   - `ANTHROPIC_API_KEY` — your Anthropic key
+   - `ANTHROPIC_API_KEY` — your Anthropic key (structured extraction + RAG answers)
+   - `OPENAI_API_KEY` — your OpenAI key (embeddings)
    - `ALLOWED_ORIGINS` — your Vercel frontend URL (e.g. `https://syllabusai.vercel.app`)
-5. Deploy. First deploy takes ~5–10 minutes (installs torch + sentence-transformers).
+5. Deploy.
 
 ### Frontend → Vercel
 
@@ -182,12 +184,27 @@ Render's free and starter tiers use an **ephemeral filesystem** — data written
 
 ### Cold start latency
 
-On first request after a Render spin-down (free/starter tiers spin down after 15 minutes of inactivity), the backend needs to:
-- Start the Python process
-- Load `sentence-transformers/all-MiniLM-L6-v2` into RAM (~90MB model)
+Free and starter tiers spin down after 15 minutes of inactivity, so the first request after a spin-down pays for the Python process starting up. There is no local model to load, so this is process start only, not model load.
 
-Expect 20–40 seconds on the first request. Subsequent requests are fast.
+### Embeddings are a network dependency
 
-### RAM usage
+Embeddings moved from a local `sentence-transformers` model to the OpenAI API. That trade was deliberate:
 
-`torch` + `sentence-transformers` + `chromadb` + `fastapi` combined use ~400–500MB RAM. Render's free tier (512MB) is borderline. Use the **Starter plan** ($7/mo) for headroom. If you see OOM kills in Render logs, that's why.
+**Gained:** no `torch` in the dependency tree, a much smaller image, a faster build, and a footprint that fits the free tier comfortably instead of borderline.
+
+**Lost:** embedding is now a paid network call on the critical path of every upload. An upload embeds every chunk in one batch request, and there is no caching, so re-uploading the same PDF pays twice. If the OpenAI API is down or rate-limits, uploads fail. There are currently no timeouts or retries on either API client.
+
+### Blocking work on the event loop
+
+`POST /upload` is declared `async def` but does synchronous blocking work inside it (pdfplumber parsing, the embedding call, the Claude call). FastAPI runs `def` endpoints in a threadpool but runs `async def` endpoints directly on the event loop, so an in-flight upload blocks the whole server for its duration. `POST /query` is a plain `def` and is handled correctly.
+
+Short-term fix is dropping the `async`. The right fix for real traffic is returning a job id immediately and doing ingestion on a worker.
+
+### No evaluation set
+
+`k=4`, the 800/50 chunk parameters, and the router's regex patterns were all chosen by inspection, not measurement. There is no labeled set of syllabi and expected answers, so retrieval quality and routing accuracy are unverified. This is the most important missing piece.
+
+Two known routing weaknesses:
+
+- The router falls through to RAG when a matched field is *empty*, but not when the match is *wrong*. "What grade do I need to pass?" matches the `grade_weights` pattern and confidently returns a grading breakdown.
+- Chunks inherit `section["start_page"]`, the page the section header appeared on. A section spanning pages will cite the section's first page for text that is on a later one.

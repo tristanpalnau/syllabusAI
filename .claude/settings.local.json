@@ -1,7 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "PowerShell(Start-Sleep -Seconds 7; Get-Content \"$env:TEMP\\\\sai_err2.txt\"; Get-Content \"$env:TEMP\\\\sai_out2.txt\")"
-    ]
-  }
-}

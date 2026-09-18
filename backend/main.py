@@ -45,7 +45,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Loaded once at startup — sentence-transformers model lives here for the process lifetime.
+# Constructed once at startup: holds the ChromaDB client and the OpenAI client
+# used for embeddings, for the lifetime of the process.
 _store = VectorStore()
 
 
