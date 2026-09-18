@@ -161,50 +161,61 @@ npm run dev
 
 ---
 
-## Known Limitations
+## Trade-offs and Known Limitations
 
-### Ephemeral filesystem on Render (important)
+Everything below is a decision I made knowingly, with what I gave up to get it.
 
-Render's free and starter tiers use an **ephemeral filesystem** — data written to disk is lost on every redeploy or restart. This affects two things:
+### Embeddings: local model vs. hosted API
 
-| Data | Location | Lost on restart? |
+I originally embedded with a local `sentence-transformers/all-MiniLM-L6-v2` model and moved to the OpenAI API.
+
+What that bought: no `torch` in the dependency tree, a much smaller image, a faster build, and a memory footprint that fits the free tier comfortably instead of sitting right at the edge of an OOM kill.
+
+What it cost: embedding is now a paid network call on the critical path of every upload, so an upload fails if the OpenAI API does. There is no embedding cache, so re-uploading the same PDF pays twice. Neither API client has timeouts or retries configured yet.
+
+For a single-syllabus-per-session workload the request volume is low and the reliability trade is worth it. At higher volume I would cache embeddings keyed by a content hash of the chunk.
+
+### Session data does not survive a restart
+
+Render's free and starter tiers use an ephemeral filesystem, so both the Chroma directory and the SQLite file are wiped on every redeploy or spin-down.
+
+| Data | Location | Survives restart? |
 |---|---|---|
-| Vector chunks | `backend/chroma_db/` | **Yes** |
-| Session structure | `backend/sessions.db` | **Yes** |
+| Vector chunks | `backend/chroma_db/` | No |
+| Session structure | `backend/sessions.db` | No |
 
-**What this means for users:** After a backend restart, existing `session_id` values stored in `localStorage` will 404 on the next query. The app handles this — `GET /session/{id}/ping` is called on page load, and a 404 response clears `localStorage` so the user sees the upload screen instead of a broken chat.
+The failure this produces is subtle: the browser still holds a `session_id` in `localStorage`, so the app restores a chat view for a session the server no longer knows about, and every question 404s. I handle it with `GET /session/{id}/ping`, which the frontend calls before restoring. A 404 clears `localStorage` and drops the user back to the upload screen.
 
-**Options to fix this properly:**
-
-1. **Render Disk** ($7/mo add-on) — Mount a persistent disk at `/data`, point `chroma_db/` and `sessions.db` there. Zero code changes beyond updating the paths. Best option if you want sessions to survive restarts.
-
-2. **Accept the limitation** — Sessions are inherently temporary (one syllabus, one conversation). The ping-on-load pattern handles it gracefully. Fine for a portfolio project.
-
-3. **In-memory ChromaDB** — Switch from `PersistentClient` to `EphemeralClient` in `vector_store.py`. Makes the ephemerality explicit: data is never written to disk so there's no illusion of persistence. SQLite still needs the disk fix.
+That is containment, not a fix. I chose it deliberately: a syllabus session is one document and one conversation, so it is arguably ephemeral by nature, and paying $7/mo for a Render Disk to persist it is not worth it for this project. If I did want persistence, the disk mount is the answer and costs nothing but a path change. The other honest option is switching Chroma to `EphemeralClient` so the code stops implying a durability it does not have.
 
 ### Cold start latency
 
-Free and starter tiers spin down after 15 minutes of inactivity, so the first request after a spin-down pays for the Python process starting up. There is no local model to load, so this is process start only, not model load.
+Free and starter tiers spin down after 15 minutes of inactivity, so the first request after an idle period waits on the Python process starting. There is no model to load into memory, so this is process start only.
 
-### Embeddings are a network dependency
+### Ingestion blocks the event loop
 
-Embeddings moved from a local `sentence-transformers` model to the OpenAI API. That trade was deliberate:
+`POST /upload` is declared `async def` but the work inside it is synchronous and blocking: pdfplumber parsing, the embedding call, the Claude call. FastAPI runs `def` endpoints in a threadpool and `async def` endpoints directly on the event loop, so an in-flight upload holds up every other request for its duration. `POST /query` is a plain `def` and is handled correctly.
 
-**Gained:** no `torch` in the dependency tree, a much smaller image, a faster build, and a footprint that fits the free tier comfortably instead of borderline.
+Dropping the `async` fixes it for current traffic. The real answer is returning a job id immediately and moving ingestion to a worker, which is also what would let me show upload progress in the UI.
 
-**Lost:** embedding is now a paid network call on the critical path of every upload. An upload embeds every chunk in one batch request, and there is no caching, so re-uploading the same PDF pays twice. If the OpenAI API is down or rate-limits, uploads fail. There are currently no timeouts or retries on either API client.
+### Retrieval parameters are unmeasured
 
-### Blocking work on the event loop
+`k=4`, the 800-character chunks with 50-character overlap, and the router's regex patterns were chosen by inspection of real syllabi, not by measurement. I have no labeled set of documents and expected answers, so I cannot claim these are optimal, only that they behaved well on what I tested.
 
-`POST /upload` is declared `async def` but does synchronous blocking work inside it (pdfplumber parsing, the embedding call, the Claude call). FastAPI runs `def` endpoints in a threadpool but runs `async def` endpoints directly on the event loop, so an in-flight upload blocks the whole server for its duration. `POST /query` is a plain `def` and is handled correctly.
+Two specific weaknesses I know about:
 
-Short-term fix is dropping the `async`. The right fix for real traffic is returning a job id immediately and doing ingestion on a worker.
+- **The router can be confidently wrong.** It falls through to semantic retrieval when a matched field is empty, but not when the match itself is bad. "What grade do I need to pass?" matches the grade-weights pattern and returns a grading breakdown, which is not the question asked. Fixing this means scoring match quality rather than treating the regex hit as binary.
+- **Page citations can be off by a page.** Chunks inherit `section["start_page"]`, the page the section header appeared on. When a section spans a page break, text from the later page is still cited to the section's first page.
 
-### No evaluation set
+### Not built yet
 
-`k=4`, the 800/50 chunk parameters, and the router's regex patterns were all chosen by inspection, not measurement. There is no labeled set of syllabi and expected answers, so retrieval quality and routing accuracy are unverified. This is the most important missing piece.
+No authentication, no rate limiting, and no file size cap on upload. Session ids are UUID4 so they are not guessable, but anyone holding one can read that session. Appropriate for a portfolio deployment, not for real users.
 
-Two known routing weaknesses:
+---
 
-- The router falls through to RAG when a matched field is *empty*, but not when the match is *wrong*. "What grade do I need to pass?" matches the `grade_weights` pattern and confidently returns a grading breakdown.
-- Chunks inherit `section["start_page"]`, the page the section header appeared on. A section spanning pages will cite the section's first page for text that is on a later one.
+## Roadmap
+
+1. **Build an evaluation set.** Ten syllabi with hand-labeled answers, so chunk size, `k`, and routing accuracy become measured rather than assumed. Everything below is easier to justify once this exists.
+2. **Score the router instead of trusting it.** Fall through to retrieval on weak matches, not just empty fields.
+3. **Move ingestion off the request path.** Job id plus a worker, which also unlocks upload progress in the UI.
+4. **Fix per-chunk page tracking** so citations are exact.
